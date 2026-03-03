@@ -1,0 +1,241 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// PRICING PARAMETERS (Temporal Versioning)
+// ============================================================================
+
+model PricingParameter {
+  id        String    @id @default(cuid())
+  name      String    // "margen_ganancia", "comision_meli", "alicuota_iibb", "costo_envio_gratis"
+  value     Decimal   @db.Decimal(5, 4) // 0.2000 = 20%
+  validFrom DateTime  @default(now())
+  validTo   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([name, validFrom])
+  @@map("pricing_parameters")
+}
+
+// ============================================================================
+// PRODUCTS
+// ============================================================================
+
+model Product {
+  id String @id @default(cuid())
+
+  // Air Intra fields
+  codigo      String  @unique // SKU
+  descrip     String
+  partNumber  String?
+  precioUSD   Decimal @db.Decimal(12, 4)
+  ivaAlicuota Decimal @db.Decimal(5, 2) // 21.00 = 21%
+  stockLUG    Int     @default(0)
+  rubro       String?
+  grupo       String?
+  estadoName  String? // "Activo", "No apto para venta", etc.
+
+  // Calculated prices
+  precioSinEnvio Decimal? @db.Decimal(12, 2)
+  precioConEnvio Decimal? @db.Decimal(12, 2)
+  lastCalculatedAt DateTime?
+
+  // ML integration
+  mlItemId       String?
+  mlItemUrl      String?
+  mlCategoryId   String?
+  mlPublishedAt  DateTime?
+  mlSyncStatus   String? // "SUCCESS", "FAILED", "PENDING"
+  mlSyncError    String?
+
+  // Selection state
+  selectedForPublish Boolean @default(false)
+
+  // Lifecycle
+  airIntraLastSeen DateTime
+  isDeleted        Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  priceHistory     PriceHistory[]
+  productSnapshots ProductSnapshot[]
+
+  // Indexes
+  @@index([codigo])
+  @@index([mlItemId])
+  @@index([isDeleted, selectedForPublish])
+  @@index([isDeleted, airIntraLastSeen])
+  @@map("products")
+}
+
+// ============================================================================
+// PRICE HISTORY
+// ============================================================================
+
+model PriceHistory {
+  id String @id @default(cuid())
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // Old values
+  oldPriceSinEnvio Decimal? @db.Decimal(12, 2)
+  oldPriceConEnvio Decimal? @db.Decimal(12, 2)
+
+  // New values
+  newPriceSinEnvio Decimal @db.Decimal(12, 2)
+  newPriceConEnvio Decimal @db.Decimal(12, 2)
+
+  // Parameters used for calculation
+  parametersUsed Json // Snapshot of pricing parameters
+
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@map("price_history")
+}
+
+// ============================================================================
+// PRODUCT SNAPSHOTS
+// ============================================================================
+
+model ProductSnapshot {
+  id String @id @default(cuid())
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  snapshot  Json // Full product state
+  reason    String // "SYNC", "ML_PUBLISH", "PRICE_CHANGE", etc.
+
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@map("product_snapshots")
+}
+
+// ============================================================================
+// SYNC LOGS
+// ============================================================================
+
+model SyncLog {
+  id String @id @default(cuid())
+
+  syncType String // "AIR_INTRA_MANUAL", "AIR_INTRA_HOURLY", "AIR_INTRA_DAILY", "ML_PUBLISH"
+  status   String // "RUNNING", "SUCCESS", "FAILED", "PARTIAL"
+
+  itemsTotal   Int @default(0)
+  itemsSuccess Int @default(0)
+  itemsFailed  Int @default(0)
+
+  startedAt   DateTime
+  completedAt DateTime?
+  durationMs  Int?
+
+  errorMessage String?
+  errorDetails Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([syncType, status, createdAt])
+  @@map("sync_logs")
+}
+
+// ============================================================================
+// DOLAR COTIZATION
+// ============================================================================
+
+model DolarCotization {
+  id String @id @default(cuid())
+
+  valorVenta Decimal @db.Decimal(10, 2) // 1025.50
+  source     String  @default("BNA") // "BNA", "MANUAL_OVERRIDE", etc.
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("dolar_cotizations")
+}
+
+// ============================================================================
+// CATEGORY MAPPING (Air Intra -> MercadoLibre)
+// ============================================================================
+
+model CategoryMapping {
+  id String @id @default(cuid())
+
+  airIntraKey  String @unique // "rubro:grupo" e.g., "Electronics:Smartphones"
+  mlCategoryId String // "MLM1055"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("category_mappings")
+}
+
+// ============================================================================
+// ML OAUTH TOKENS (Encrypted)
+// ============================================================================
+
+model MLToken {
+  id String @id @default(cuid())
+
+  accessToken  String // Encrypted
+  refreshToken String // Encrypted
+  expiresAt    DateTime
+
+  createdAt DateTime @default(now())
+
+  @@map("ml_tokens")
+}
+
+// ============================================================================
+// TOKEN LOCK (Distributed Lock for OAuth Refresh)
+// ============================================================================
+
+model TokenLock {
+  id         String   @id // "ml-token-refresh"
+  operation  String // "refresh"
+  acquiredAt DateTime
+  expiresAt  DateTime
+
+  @@map("token_locks")
+}
+
+// ============================================================================
+// SYNC LOCK (Prevents Cron Overlap)
+// ============================================================================
+
+model SyncLock {
+  id         String   @id // "sync-hourly", "sync-daily"
+  acquiredAt DateTime
+  expiresAt  DateTime
+
+  @@map("sync_locks")
+}
+
+// ============================================================================
+// SYSTEM CONFIG (Manual Overrides)
+// ============================================================================
+
+model SystemConfig {
+  key   String @id // "dolar_manual_override"
+  value String // JSON or plain value
+
+  updatedAt DateTime @updatedAt
+
+  @@map("system_config")
+}
